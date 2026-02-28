@@ -18,6 +18,7 @@ class Settings:
     # OpenRouter API
     OPENROUTER_API_KEY: str = field(default_factory=lambda: getenv("OPENROUTER_API_KEY", ""))
     OPENROUTER_MODEL: str = field(default_factory=lambda: getenv("OPENROUTER_MODEL", "anthropic/claude-sonnet-4"))
+    OPENROUTER_AUDIO_MODEL: str = field(default_factory=lambda: getenv("OPENROUTER_AUDIO_MODEL", "openai/gpt-audio-mini"))
 
     # GitHub
     GITHUB_TOKEN: str = field(default_factory=lambda: getenv("GITHUB_TOKEN", ""))

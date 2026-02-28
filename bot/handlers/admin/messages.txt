@@ -25,7 +25,7 @@ Hot-кандидаты: {hot_count}
 <b>Топ-3 кандидата:</b>
 
 ## TOP_CANDIDATE
-{index}. <b>{name}</b> — {score}/30{hot_badge}
+{index}. <b>{name}</b> — {score}/50{hot_badge}
 {summary}
 
 ## TOP_EMPTY
@@ -40,7 +40,7 @@ Hot-кандидаты: {hot_count}
 ## CANDIDATE_CARD
 <b>Кандидат #{id}</b>
 Имя: {name}
-Скор: {total}/30{hot_badge}
+Скор: {total}/50{hot_badge}
 
 <b>Ответы:</b>
 {answers}

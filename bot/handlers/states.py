@@ -1,8 +1,12 @@
 """
-FSM-состояния для диалога с кандидатом.
+FSM-состояния для диалога с кандидатом и администратором.
 """
 
 from aiogram.fsm.state import StatesGroup, State
+
+
+class AdminStates(StatesGroup):
+    waiting_voice_test = State()  # Ожидание голосового для теста транскрибации
 
 
 class CandidateStates(StatesGroup):

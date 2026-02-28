@@ -1,15 +1,42 @@
 """
 Сервис для работы с OpenRouter API (OpenAI-совместимый интерфейс).
-Анализ контекста ответов и генерация скоринга.
+Анализ ответов кандидата и генерация Pentagon-скоринга.
 """
 
+from __future__ import annotations
+
+import json
+import logging
+from pathlib import Path
 from typing import Any
 
 from openai import AsyncOpenAI
 
 from bot.config import settings
 
+logger = logging.getLogger(__name__)
+
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+_SCORING_PROMPT_PATH = Path(__file__).parent.parent.parent / "prompts" / "scoring.txt"
+
+_AXIS_RUBRIC = """
+Три критерия оценки (0–10):
+
+• task_decomposition — Декомпозиция задачи + AI-планирование
+  0–3: Нет понимания где и зачем использовать AI
+  4–6: Базовое разделение задач, без системного подхода к AI
+  7–10: Чёткая декомпозиция, понимает trade-offs, знает когда AI уместен
+
+• prompting_tools — Промптинг + экосистема инструментов
+  0–3: Базовые промпты без итерации, знает 1–2 инструмента
+  4–6: Есть систематика в промптах, знает несколько инструментов
+  7–10: Структурированные промпты, верификация, широкое знание экосистемы
+
+• critical_thinking — Критическое мышление к AI
+  0–3: Доверяет AI без критической проверки
+  4–6: Проверяет результаты, понимает основные ограничения
+  7–10: Системная верификация, понимает где AI ошибается
+"""
 
 
 class LLMService:
@@ -22,25 +49,127 @@ class LLMService:
         )
         self._model = settings.OPENROUTER_MODEL
 
+    async def _call_llm(self, system: str, user: str) -> str | None:
+        """Выполняет запрос к LLM, возвращает текст ответа или None при ошибке."""
+        try:
+            response = await self._client.chat.completions.create(
+                model=self._model,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                temperature=0.3,
+            )
+            return response.choices[0].message.content
+        except Exception:
+            logger.exception("LLM request failed")
+            return None
+
+    @staticmethod
+    def _parse_json(text: str) -> dict[str, Any] | None:
+        """Парсит JSON из ответа LLM, убирая markdown-обёртки если есть."""
+        if not text:
+            return None
+        cleaned = text.strip()
+        if cleaned.startswith("```"):
+            lines = cleaned.split("\n")
+            # Remove first and last ``` lines
+            cleaned = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
+        try:
+            return json.loads(cleaned)
+        except json.JSONDecodeError:
+            logger.warning("Failed to parse LLM JSON: %.200s", text)
+            return None
+
     async def analyze_answer(
-        self, question: str, answer: str, context: list[dict[str, str]]
-    ) -> dict[str, Any]:
+        self,
+        question: str,
+        answer: str,
+        context: list[dict[str, str]],
+        primary_axes: list[str],
+    ) -> dict[str, Any] | None:
         """
-        Анализ ответа кандидата в контексте предыдущих ответов.
-        Возвращает: нужен ли уточняющий вопрос, текст следующего вопроса.
+        Анализ ответа кандидата в фоне после подтверждения.
+
+        Возвращает:
+        {
+            "feedback": str,           # 2–4 предложения для итогового отчёта
+            "needs_followup": bool,    # True если оценка по primary axis ≤ 3
+            "followup_question": str | None,
+        }
         """
-        # TODO: промпт для адаптивного анализа
-        pass
+        context_str = ""
+        if context:
+            lines = []
+            for i, item in enumerate(context, 1):
+                if item.get("answer"):
+                    lines.append(f"Вопрос {i}: {item['question']}\nОтвет {i}: {item['answer']}")
+            context_str = "\n\n".join(lines)
+
+        primary_axes_str = ", ".join(primary_axes) if primary_axes else "все оси"
+
+        system_prompt = f"""Ты — старший технический рекрутер, оценивающий кандидата на позицию Junior AI-first Developer.
+
+{_AXIS_RUBRIC}
+
+Твоя задача: проанализировать один ответ кандидата и вернуть краткий фидбэк + решение об уточняющем вопросе.
+
+Ключевые оси для этого вопроса: {primary_axes_str}
+Уточняющий вопрос нужен ТОЛЬКО если оценка по ЛЮБОЙ из ключевых осей ≤ 3.
+
+Верни ответ строго в формате JSON без markdown-обёртки:
+{{
+  "feedback": "<2–4 предложения на русском, основанные на фактах ответа, без оценочных суждений типа 'хорошо' или 'плохо'>",
+  "needs_followup": <true или false>,
+  "followup_question": "<целевой уточняющий вопрос на русском если needs_followup=true, иначе null>"
+}}"""
+
+        user_content = f"Вопрос: {question}\n\nОтвет кандидата: {answer}"
+        if context_str:
+            user_content += f"\n\nКонтекст предыдущих ответов:\n{context_str}"
+
+        raw = await self._call_llm(system_prompt, user_content)
+        return self._parse_json(raw)
 
     async def generate_scoring(
         self,
         answers: list[dict[str, str]],
         github_data: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | None:
         """
-        Финальный скоринг кандидата по трём критериям.
-        Возвращает JSON с полями: delegation, decomposition, criticality,
-        каждое содержит score (1-10), reasoning, quote.
+        Финальный Pentagon-скоринг кандидата по 5 осям.
+
+        Возвращает JSON с полями: ai_in_product, vibe_coding, prompt_engineering,
+        tool_awareness, pipeline_thinking (каждое: score + reasoning),
+        total_score, summary, recommendation, recommendation_reason.
         """
-        # TODO: промпт для скоринга, парсинг JSON-ответа
-        pass
+        try:
+            system_prompt = _SCORING_PROMPT_PATH.read_text(encoding="utf-8")
+        except OSError:
+            logger.error("scoring.txt not found at %s", _SCORING_PROMPT_PATH)
+            return None
+
+        answers_str = "\n\n".join(
+            f"Вопрос {i}: {item['question']}\nОтвет: {item['answer']}"
+            for i, item in enumerate(answers, 1)
+            if item.get("answer")
+        )
+
+        github_str = ""
+        if github_data:
+            github_str = f"""
+Данные GitHub-репозитория:
+- URL: {github_data.get('repo_url', 'N/A')}
+- README: {'есть' if github_data.get('has_readme') else 'нет'}
+- Количество коммитов: {github_data.get('commit_count', 0)}
+- Основной язык: {github_data.get('primary_language') or 'не определён'}
+- Последний коммит: {github_data.get('last_commit_at') or 'неизвестно'}
+- Фрагмент README: {github_data.get('readme_snippet') or 'нет'}
+"""
+
+        user_content = f"Ответы кандидата:\n\n{answers_str}"
+        if github_str:
+            user_content += f"\n\n{github_str}"
+
+        raw = await self._call_llm(system_prompt, user_content)
+        return self._parse_json(raw)

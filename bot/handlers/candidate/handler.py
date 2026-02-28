@@ -4,6 +4,9 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
+from io import BytesIO
 from pathlib import Path
 
 import asyncpg
@@ -23,18 +26,31 @@ from aiogram.types import (
 from bot.db.repositories import answers as answers_repo
 from bot.db.repositories import candidates as candidates_repo
 from bot.db.repositories import github as github_repo
+from bot.db.repositories import question_analyses as question_analyses_repo
 from bot.db.repositories import scoring as scoring_repo
 from bot.handlers.states import CandidateStates
 from bot.config import settings
 from bot.services.github import GitHubService
 from bot.services.llm import LLMService
+from bot.services.voice import VoiceService
 from bot.utils.messages import load_messages
 from bot.utils.validators import is_valid_full_name, parse_full_name
+
+logger = logging.getLogger(__name__)
 
 _MSG_PATH = Path(__file__).parent / "messages.txt"
 MSG = load_messages(_MSG_PATH)
 
-BASE_QUESTIONS = ["QUESTION_1", "QUESTION_2", "QUESTION_3"]
+BASE_QUESTIONS = ["QUESTION_1", "QUESTION_2", "QUESTION_3", "QUESTION_4", "QUESTION_5"]
+
+# Primary axes evaluated per question (used for follow-up threshold and background analysis)
+_PRIMARY_AXES: dict[int, list[str]] = {
+    0: ["task_decomposition", "critical_thinking"],
+    1: ["prompting_tools"],
+    2: ["prompting_tools"],
+    3: ["prompting_tools"],
+    4: ["task_decomposition"],
+}
 
 _SOURCE_LABELS = {"hh": "HeadHunter", "telegram": "Telegram", "other": "Другой источник"}
 
@@ -42,6 +58,10 @@ _VOICE_LIMIT_SECONDS = 120
 
 _llm = LLMService()
 _github = GitHubService()
+_voice = VoiceService()
+
+# Module-level: background analysis tasks per candidate_id
+_analysis_tasks: dict[int, list[asyncio.Task]] = {}
 
 router = Router(name="candidate")
 
@@ -224,7 +244,6 @@ async def process_confirm(
     await callback.message.edit_text(MSG["CONFIRMED"])
     await callback.answer()
 
-    # Показываем инструкцию с кнопкой — вопрос задаётся только после нажатия
     await state.set_state(CandidateStates.pre_interview)
     await state.update_data(candidate_id=candidate_id)
     await callback.message.answer(MSG["INSTRUCTION"], reply_markup=_start_keyboard())
@@ -285,17 +304,20 @@ async def start_interview(
 async def process_answer(
     message: Message, state: FSMContext, db_pool: asyncpg.Pool
 ) -> None:
-    # Голосовое сообщение: проверяем длину
     if message.voice:
         if message.voice.duration > _VOICE_LIMIT_SECONDS:
             await message.answer(MSG["VOICE_TOO_LONG"])
             return
         pending_answer = f"[Голосовое сообщение, {message.voice.duration}с]"
+        await state.update_data(
+            pending_answer=pending_answer,
+            pending_voice_file_id=message.voice.file_id,
+            pending_voice_unique_id=message.voice.file_unique_id,
+        )
     else:
         pending_answer = message.text
+        await state.update_data(pending_answer=pending_answer, pending_voice_file_id=None)
 
-    # Храним ответ в FSM до подтверждения — в БД не пишем
-    await state.update_data(pending_answer=pending_answer)
     await message.answer(MSG["ANSWER_RECEIVED"], reply_markup=_answer_keyboard())
     await state.set_state(CandidateStates.confirming_answer)
 
@@ -307,47 +329,89 @@ async def confirm_answer(
     data = await state.get_data()
     candidate_id: int = data["candidate_id"]
     question_index: int = data["question_index"]
-    followup_done: bool = data["followup_done"]
+    followup_done: bool = data.get("followup_done", False)
     current_answer_id: int = data["current_answer_id"]
-    pending_answer: str = data["pending_answer"]
+    current_seq_number: int = data.get("current_seq_number", 1)
     current_question_text: str = data["current_question_text"]
+    pending_answer: str = data["pending_answer"]
+    voice_file_id: str | None = data.get("pending_voice_file_id")
+    voice_unique_id: str = data.get("pending_voice_unique_id", "audio")
 
-    # Сохраняем подтверждённый ответ в БД
-    await answers_repo.set_answer(db_pool, current_answer_id, pending_answer)
-
-    # Меняем сообщение на подтверждение, убираем кнопки
-    await callback.message.edit_text("Ответ записан.")
     await callback.answer()
 
-    if followup_done:
-        await _advance_to_next(callback.message, state, db_pool, candidate_id, question_index)
+    if voice_file_id:
+        # Transcribe synchronously before proceeding
+        await callback.message.edit_text(MSG["VOICE_TRANSCRIBING"])
+        audio = await callback.bot.download(voice_file_id)
+        transcription = await _voice.transcribe(audio, filename=f"voice_{voice_unique_id}.ogg")
+        if not transcription:
+            await callback.message.edit_text(MSG["VOICE_TRANSCRIPTION_FAILED"])
+            await callback.message.answer(current_question_text)
+            await state.update_data(pending_answer=None, pending_voice_file_id=None)
+            await state.set_state(CandidateStates.answering)
+            return
+        pending_answer = transcription
+        await answers_repo.set_answer(db_pool, current_answer_id, pending_answer)
+        await callback.message.edit_text("Ответ записан.")
+    else:
+        await answers_repo.set_answer(db_pool, current_answer_id, pending_answer)
+        await callback.message.edit_text("Ответ записан.")
+
+    is_last_base_question = (question_index == len(BASE_QUESTIONS) - 1) and not followup_done
+
+    if is_last_base_question:
+        await _wait_for_analyses_and_ask_followups(
+            callback, state, db_pool, candidate_id, question_index,
+            pending_answer, current_question_text, current_seq_number,
+        )
         return
 
-    # Адаптивный анализ через LLM
+    if followup_done:
+        followup_queue: list[str] = data.get("followup_queue", [])
+        if followup_queue:
+            fup_text = followup_queue[0]
+            remaining = followup_queue[1:]
+            seq = await answers_repo.get_next_seq_number(db_pool, candidate_id)
+            answer_id = await answers_repo.add_question(
+                db_pool, candidate_id, seq, fup_text, is_adaptive=True
+            )
+            await state.update_data(
+                followup_queue=remaining,
+                current_answer_id=answer_id,
+                current_seq_number=seq,
+                current_question_text=fup_text,
+                pending_answer=None,
+            )
+            await state.set_state(CandidateStates.answering)
+            await callback.message.answer(fup_text)
+            return
+        await state.set_state(CandidateStates.waiting_github)
+        await state.set_data({"candidate_id": candidate_id})
+        await callback.message.answer(MSG["GITHUB_REQUEST"])
+        return
+
+    # ASYNC PATH for Q1–Q4: fire background analysis, immediately advance to next question
     history = [
         {"question": row["question_text"], "answer": row["answer_text"]}
         for row in await answers_repo.get_answers(db_pool, candidate_id)
         if row["answer_text"]
     ]
-    processing_msg = await callback.message.answer(MSG["PROCESSING"])
-    analysis = await _llm.analyze_answer(current_question_text, pending_answer, history)
-    await processing_msg.delete()
-
-    if analysis and analysis.get("needs_followup") and analysis.get("followup_question"):
-        followup_text: str = analysis["followup_question"]
-        seq = await answers_repo.get_next_seq_number(db_pool, candidate_id)
-        followup_id = await answers_repo.add_question(
-            db_pool, candidate_id, seq, followup_text, is_adaptive=True
+    task = asyncio.create_task(
+        _background_analyze(
+            db_pool=db_pool,
+            candidate_id=candidate_id,
+            question_seq=current_seq_number,
+            question_text=current_question_text,
+            answer_text=pending_answer,
+            history=history,
+            question_index=question_index,
         )
-        await state.set_state(CandidateStates.answering)
-        await state.update_data(
-            followup_done=True,
-            current_answer_id=followup_id,
-            current_question_text=followup_text,
-            pending_answer=None,
-        )
-        await callback.message.answer(followup_text)
-        return
+    )
+    _analysis_tasks.setdefault(candidate_id, []).append(task)
+    task.add_done_callback(
+        lambda t, cid=candidate_id: _analysis_tasks[cid].remove(t)
+        if t in _analysis_tasks.get(cid, []) else None
+    )
 
     await _advance_to_next(callback.message, state, db_pool, candidate_id, question_index)
 
@@ -416,31 +480,29 @@ async def process_github_link(
 
     if scoring:
         total = (
-            scoring["delegation"]["score"]
-            + scoring["decomposition"]["score"]
-            + scoring["criticality"]["score"]
+            scoring["task_decomposition"]["score"]
+            + scoring["prompting_tools"]["score"]
+            + scoring["critical_thinking"]["score"]
         )
         is_hot = total >= settings.HOT_THRESHOLD
 
         await scoring_repo.insert_scoring_result(
             db_pool,
             candidate_id=candidate_id,
-            delegation_score=scoring["delegation"]["score"],
-            delegation_reasoning=scoring["delegation"]["reasoning"],
-            delegation_quote=scoring["delegation"]["quote"],
-            decomposition_score=scoring["decomposition"]["score"],
-            decomposition_reasoning=scoring["decomposition"]["reasoning"],
-            decomposition_quote=scoring["decomposition"]["quote"],
-            criticality_score=scoring["criticality"]["score"],
-            criticality_reasoning=scoring["criticality"]["reasoning"],
-            criticality_quote=scoring["criticality"]["quote"],
+            task_decomposition_score=scoring["task_decomposition"]["score"],
+            task_decomposition_reasoning=scoring["task_decomposition"]["reasoning"],
+            prompting_tools_score=scoring["prompting_tools"]["score"],
+            prompting_tools_reasoning=scoring["prompting_tools"]["reasoning"],
+            critical_thinking_score=scoring["critical_thinking"]["score"],
+            critical_thinking_reasoning=scoring["critical_thinking"]["reasoning"],
             total_score=total,
             summary=scoring.get("summary", ""),
+            recommendation=scoring.get("recommendation", "consider"),
             is_hot=is_hot,
         )
 
         await candidates_repo.mark_scored(db_pool, candidate_id)
-        await _show_scoring(message, scoring, total)
+        await _show_scoring(message, scoring, total, answers_list)
 
     await state.set_state(CandidateStates.finished)
     await message.answer(MSG["FAREWELL"])
@@ -482,7 +544,9 @@ async def _ask_base_question(
         "candidate_id": candidate_id,
         "question_index": question_index,
         "followup_done": False,
+        "followup_queue": [],
         "current_answer_id": answer_id,
+        "current_seq_number": seq,
         "current_question_text": question_text,
         "pending_answer": None,
     })
@@ -503,6 +567,112 @@ async def _advance_to_next(
         await state.set_state(CandidateStates.waiting_github)
         await state.set_data({"candidate_id": candidate_id})
         await message.answer(MSG["GITHUB_REQUEST"])
+
+
+async def _background_analyze(
+    db_pool: asyncpg.Pool,
+    candidate_id: int,
+    question_seq: int,
+    question_text: str,
+    answer_text: str,
+    history: list[dict],
+    question_index: int,
+) -> None:
+    """Фоновый анализ ответа кандидата. Ошибки не прерывают основной поток."""
+    try:
+        primary_axes = _PRIMARY_AXES.get(question_index, [])
+        result = await _llm.analyze_answer(question_text, answer_text, history, primary_axes)
+        if result:
+            await question_analyses_repo.insert_question_analysis(
+                db_pool,
+                candidate_id=candidate_id,
+                question_seq=question_seq,
+                feedback_text=result.get("feedback", ""),
+                needs_followup=result.get("needs_followup", False),
+                followup_text=result.get("followup_question"),
+            )
+    except Exception:
+        logger.exception(
+            "Background analysis failed for candidate=%d seq=%d", candidate_id, question_seq
+        )
+
+
+async def _wait_for_analyses_and_ask_followups(
+    callback: CallbackQuery,
+    state: FSMContext,
+    db_pool: asyncpg.Pool,
+    candidate_id: int,
+    question_index: int,
+    last_answer: str,
+    question_text: str,
+    question_seq: int,
+) -> None:
+    """
+    Синхронная точка после Q5:
+    1. Показывает загрузочное сообщение
+    2. Анализирует Q5 синхронно (голос к этому моменту уже транскрибирован)
+    3. Дожидается фоновых задач Q1-Q4
+    4. Удаляет загрузочное сообщение
+    5. Задаёт follow-up вопросы или переходит к GitHub
+    """
+    analyzing_msg = await callback.message.answer(MSG["ANALYZING_ANSWERS"])
+    await callback.bot.send_chat_action(callback.message.chat.id, "typing")
+
+    history = [
+        {"question": row["question_text"], "answer": row["answer_text"]}
+        for row in await answers_repo.get_answers(db_pool, candidate_id)
+        if row["answer_text"]
+    ]
+    primary_axes = _PRIMARY_AXES[question_index]
+    q5_result = await _llm.analyze_answer(question_text, last_answer, history, primary_axes)
+    if q5_result:
+        await question_analyses_repo.insert_question_analysis(
+            db_pool,
+            candidate_id=candidate_id,
+            question_seq=question_seq,
+            feedback_text=q5_result.get("feedback", ""),
+            needs_followup=q5_result.get("needs_followup", False),
+            followup_text=q5_result.get("followup_question"),
+        )
+
+    # Wait for any still-running Q1-Q4 background tasks
+    pending = list(_analysis_tasks.get(candidate_id, []))
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+
+    await analyzing_msg.delete()
+
+    # Collect follow-up queue (max 2 total)
+    followups = await question_analyses_repo.get_pending_followups(db_pool, candidate_id)
+    followup_texts = [
+        f["followup_text"] for f in followups[:2] if f["followup_text"]
+    ]
+
+    if followup_texts:
+        fup_text = followup_texts[0]
+        remaining = followup_texts[1:]
+        seq = await answers_repo.get_next_seq_number(db_pool, candidate_id)
+        answer_id = await answers_repo.add_question(
+            db_pool, candidate_id, seq, fup_text, is_adaptive=True
+        )
+        await state.set_state(CandidateStates.answering)
+        await state.set_data({
+            "candidate_id": candidate_id,
+            "question_index": question_index,
+            "followup_done": True,
+            "followup_queue": remaining,
+            "current_answer_id": answer_id,
+            "current_seq_number": seq,
+            "current_question_text": fup_text,
+            "pending_answer": None,
+        })
+        await callback.message.answer(fup_text)
+        return
+
+    # No follow-ups → proceed to GitHub
+    await state.set_state(CandidateStates.waiting_github)
+    await state.set_data({"candidate_id": candidate_id})
+    await callback.message.answer(MSG["GITHUB_REQUEST"])
 
 
 async def _resume_session(
@@ -527,7 +697,9 @@ async def _resume_session(
             "candidate_id": candidate_id,
             "question_index": question_index,
             "followup_done": followup_done,
+            "followup_queue": [],
             "current_answer_id": pending["id"],
+            "current_seq_number": pending["seq_number"],
             "current_question_text": pending["question_text"],
             "pending_answer": None,
         })
@@ -547,27 +719,30 @@ async def _show_scoring(
     message: Message,
     scoring: dict,
     total: int,
+    answers_list: list[dict],
 ) -> None:
-    criterion_names = {
-        "delegation": "Делегирование AI",
-        "decomposition": "Декомпозиция",
-        "criticality": "Критичность",
-    }
+    await message.bot.send_chat_action(message.chat.id, "typing")
 
-    await message.answer(MSG["SCORING_HEADER"])
-
-    for key, name in criterion_names.items():
-        criterion = scoring[key]
-        text = MSG["SCORING_CRITERION"].format(
-            criterion=name,
-            score=criterion["score"],
-            reasoning=criterion["reasoning"],
-            quote=criterion["quote"],
+    # Send Q+A blocks (base questions only — first 5 answered)
+    base_qas = [a for a in answers_list if a.get("answer")][:5]
+    for i, qa in enumerate(base_qas, 1):
+        await message.answer(
+            MSG["SCORING_QA_BLOCK"].format(
+                number=i,
+                question=qa["question"],
+                answer=qa["answer"],
+            )
         )
-        await message.answer(text)
 
+    # One combined scoring message
     await message.answer(
-        MSG["SCORING_TOTAL"].format(
+        MSG["SCORING_RESULT"].format(
+            task_decomposition_score=scoring["task_decomposition"]["score"],
+            task_decomposition_reasoning=scoring["task_decomposition"]["reasoning"],
+            prompting_tools_score=scoring["prompting_tools"]["score"],
+            prompting_tools_reasoning=scoring["prompting_tools"]["reasoning"],
+            critical_thinking_score=scoring["critical_thinking"]["score"],
+            critical_thinking_reasoning=scoring["critical_thinking"]["reasoning"],
             total=total,
             summary=scoring.get("summary", ""),
         )

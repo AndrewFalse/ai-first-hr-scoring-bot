@@ -9,14 +9,60 @@ from pathlib import Path
 import asyncpg
 from aiogram import Router, F
 from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
 from aiogram.types import Message
 
+from bot.handlers.states import AdminStates
+from bot.services.voice import VoiceService
 from bot.utils.messages import load_messages
 
 _MSG_PATH = Path(__file__).parent / "messages.txt"
 MSG = load_messages(_MSG_PATH)
 
+_voice = VoiceService()
+
 router = Router(name="admin")
+
+
+@router.message(Command("test_voice"))
+async def cmd_test_voice(
+    message: Message, state: FSMContext
+) -> None:
+    """Тест транскрибации: ожидаем голосовое от администратора."""
+    await state.set_state(AdminStates.waiting_voice_test)
+    await message.answer("Отправь голосовое сообщение — я покажу транскрипцию.")
+
+
+@router.message(AdminStates.waiting_voice_test, F.voice)
+async def process_voice_test(
+    message: Message, state: FSMContext
+) -> None:
+    """Транскрибирует голосовое и возвращает результат."""
+    await state.clear()
+    status = await message.answer("⏳ Транскрибирую...")
+    audio = await message.bot.download(message.voice.file_id)
+    result = await _voice.transcribe(audio, filename=f"voice_{message.voice.file_unique_id}.ogg")
+    await status.delete()
+    if result:
+        await message.answer(f"<b>Транскрипция:</b>\n\n{result}", parse_mode="HTML")
+    else:
+        await message.answer("❌ Транскрибация не удалась. Проверь настройки OPENROUTER_AUDIO_MODEL.")
+
+
+@router.message(AdminStates.waiting_voice_test)
+async def process_voice_test_wrong(
+    message: Message, state: FSMContext
+) -> None:
+    """Напоминает отправить именно голосовое."""
+    await message.answer("Нужно голосовое сообщение. Отправь его или /cancel для отмены.")
+
+
+@router.message(Command("cancel"))
+async def cmd_cancel(
+    message: Message, state: FSMContext
+) -> None:
+    await state.clear()
+    await message.answer("Отменено.")
 
 
 @router.message(Command("init_admin"))
