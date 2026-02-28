@@ -17,8 +17,9 @@ class Settings:
 
     # OpenRouter API
     OPENROUTER_API_KEY: str = field(default_factory=lambda: getenv("OPENROUTER_API_KEY", ""))
-    OPENROUTER_MODEL: str = field(default_factory=lambda: getenv("OPENROUTER_MODEL", "anthropic/claude-sonnet-4"))
+    OPENROUTER_MODEL: str = field(default_factory=lambda: getenv("OPENROUTER_MODEL", "anthropic/claude-sonnet-4-5"))
     OPENROUTER_AUDIO_MODEL: str = field(default_factory=lambda: getenv("OPENROUTER_AUDIO_MODEL", "openai/gpt-audio-mini"))
+    OPENROUTER_VALIDATION_MODEL: str = field(default_factory=lambda: getenv("OPENROUTER_VALIDATION_MODEL", "google/gemini-3-flash-preview"))
 
     # GitHub
     GITHUB_TOKEN: str = field(default_factory=lambda: getenv("GITHUB_TOKEN", ""))
@@ -36,6 +37,9 @@ class Settings:
 
     # Database
     DATABASE_URL: str = field(default_factory=lambda: getenv("DATABASE_URL", ""))
+
+    # Поддержка
+    SUPPORT_CHAT_ID: str = field(default_factory=lambda: getenv("SUPPORT_CHAT_ID", ""))
 
     # Скоринг
     HOT_THRESHOLD: int = field(

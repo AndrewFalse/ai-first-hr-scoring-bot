@@ -9,6 +9,10 @@ class AdminStates(StatesGroup):
     waiting_voice_test = State()  # Ожидание голосового для теста транскрибации
 
 
+class SupportStates(StatesGroup):
+    waiting_message = State()  # Ожидание сообщения для поддержки
+
+
 class CandidateStates(StatesGroup):
     # Онбординг
     waiting_contact   = State()  # Ожидание шаринга контакта

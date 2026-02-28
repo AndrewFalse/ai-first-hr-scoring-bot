@@ -96,6 +96,8 @@ class GitHubService:
 
             return {
                 "repo_url": repo.html_url,
+                "owner_login": repo.owner.login,
+                "owner_name": repo.owner.name,
                 "has_readme": has_readme,
                 "commit_count": commit_count,
                 "primary_language": repo.language,

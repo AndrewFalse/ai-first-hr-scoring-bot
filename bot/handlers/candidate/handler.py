@@ -28,7 +28,7 @@ from bot.db.repositories import candidates as candidates_repo
 from bot.db.repositories import github as github_repo
 from bot.db.repositories import question_analyses as question_analyses_repo
 from bot.db.repositories import scoring as scoring_repo
-from bot.handlers.states import CandidateStates
+from bot.handlers.states import CandidateStates, SupportStates
 from bot.config import settings
 from bot.services.github import GitHubService
 from bot.services.llm import LLMService
@@ -44,12 +44,13 @@ MSG = load_messages(_MSG_PATH)
 BASE_QUESTIONS = ["QUESTION_1", "QUESTION_2", "QUESTION_3", "QUESTION_4", "QUESTION_5"]
 
 # Primary axes evaluated per question (used for follow-up threshold and background analysis)
+# New order: pipeline(0), tools(1), IDE(2), prompting(3), product(4)
 _PRIMARY_AXES: dict[int, list[str]] = {
-    0: ["task_decomposition", "critical_thinking"],
+    0: ["task_decomposition"],
     1: ["prompting_tools"],
     2: ["prompting_tools"],
     3: ["prompting_tools"],
-    4: ["task_decomposition"],
+    4: ["task_decomposition", "critical_thinking"],
 }
 
 _SOURCE_LABELS = {"hh": "HeadHunter", "telegram": "Telegram", "other": "Другой источник"}
@@ -106,9 +107,48 @@ def _start_keyboard() -> InlineKeyboardMarkup:
 
 def _answer_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="🔄 Повторить", callback_data="answer:retry"),
-        InlineKeyboardButton(text="➡️ Продолжить", callback_data="answer:confirm"),
+        InlineKeyboardButton(text="✏️ Изменить", callback_data="answer:edit"),
+        InlineKeyboardButton(text="✅ Отправить", callback_data="answer:submit"),
     ]])
+
+
+def _github_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="⏭ Пропустить", callback_data="github:skip"),
+    ]])
+
+
+# ---------------------------------------------------------------------------
+# /support
+# ---------------------------------------------------------------------------
+
+@router.message(Command("support"))
+async def cmd_support(message: Message, state: FSMContext) -> None:
+    await state.set_state(SupportStates.waiting_message)
+    await message.answer(MSG["SUPPORT_PROMPT"])
+
+
+@router.message(SupportStates.waiting_message, F.text)
+async def process_support_message(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    if not settings.SUPPORT_CHAT_ID:
+        await message.answer(MSG["SUPPORT_UNAVAILABLE"])
+        return
+    user = message.from_user
+    username = f"@{user.username}" if user.username else "без username"
+    forwarded = (
+        f"📨 Обращение в поддержку\n"
+        f"👤 {user.full_name} ({username})\n"
+        f"🆔 {user.id}\n\n"
+        f"{message.text}"
+    )
+    await message.bot.send_message(settings.SUPPORT_CHAT_ID, forwarded)
+    await message.answer(MSG["SUPPORT_SENT"])
+
+
+@router.message(SupportStates.waiting_message)
+async def process_support_non_text(message: Message, state: FSMContext) -> None:
+    await message.answer(MSG["SUPPORT_TEXT_ONLY"])
 
 
 # ---------------------------------------------------------------------------
@@ -300,29 +340,44 @@ async def start_interview(
 # Ответы на вопросы (текст или голос)
 # ---------------------------------------------------------------------------
 
+_VOICE_MIN_SECONDS = 5
+
 @router.message(CandidateStates.answering, F.text | F.voice)
 async def process_answer(
     message: Message, state: FSMContext, db_pool: asyncpg.Pool
 ) -> None:
     if message.voice:
+        if message.voice.duration < _VOICE_MIN_SECONDS:
+            await message.answer(MSG["VOICE_TOO_SHORT"])
+            return
         if message.voice.duration > _VOICE_LIMIT_SECONDS:
             await message.answer(MSG["VOICE_TOO_LONG"])
             return
-        pending_answer = f"[Голосовое сообщение, {message.voice.duration}с]"
-        await state.update_data(
-            pending_answer=pending_answer,
-            pending_voice_file_id=message.voice.file_id,
-            pending_voice_unique_id=message.voice.file_unique_id,
+        transcribing_msg = await message.answer(MSG["VOICE_TRANSCRIBING"])
+        audio = await message.bot.download(message.voice.file_id)
+        transcription = await _voice.transcribe(
+            audio, filename=f"voice_{message.voice.file_unique_id}.ogg"
         )
+        await transcribing_msg.delete()
+        if not transcription:
+            await message.answer(MSG["VOICE_TRANSCRIPTION_FAILED"])
+            return
+        pending_answer = transcription
+        label = "Голосовое распознано:"
     else:
         pending_answer = message.text
-        await state.update_data(pending_answer=pending_answer, pending_voice_file_id=None)
+        label = "Твой ответ:"
 
-    await message.answer(MSG["ANSWER_RECEIVED"], reply_markup=_answer_keyboard())
+    await state.update_data(pending_answer=pending_answer)
+    await message.answer(
+        MSG["ANSWER_PREVIEW"].format(label=label, answer=pending_answer),
+        reply_markup=_answer_keyboard(),
+        parse_mode="HTML",
+    )
     await state.set_state(CandidateStates.confirming_answer)
 
 
-@router.callback_query(CandidateStates.confirming_answer, F.data == "answer:confirm")
+@router.callback_query(CandidateStates.confirming_answer, F.data == "answer:submit")
 async def confirm_answer(
     callback: CallbackQuery, state: FSMContext, db_pool: asyncpg.Pool
 ) -> None:
@@ -334,28 +389,10 @@ async def confirm_answer(
     current_seq_number: int = data.get("current_seq_number", 1)
     current_question_text: str = data["current_question_text"]
     pending_answer: str = data["pending_answer"]
-    voice_file_id: str | None = data.get("pending_voice_file_id")
-    voice_unique_id: str = data.get("pending_voice_unique_id", "audio")
 
     await callback.answer()
-
-    if voice_file_id:
-        # Transcribe synchronously before proceeding
-        await callback.message.edit_text(MSG["VOICE_TRANSCRIBING"])
-        audio = await callback.bot.download(voice_file_id)
-        transcription = await _voice.transcribe(audio, filename=f"voice_{voice_unique_id}.ogg")
-        if not transcription:
-            await callback.message.edit_text(MSG["VOICE_TRANSCRIPTION_FAILED"])
-            await callback.message.answer(current_question_text)
-            await state.update_data(pending_answer=None, pending_voice_file_id=None)
-            await state.set_state(CandidateStates.answering)
-            return
-        pending_answer = transcription
-        await answers_repo.set_answer(db_pool, current_answer_id, pending_answer)
-        await callback.message.edit_text("Ответ записан.")
-    else:
-        await answers_repo.set_answer(db_pool, current_answer_id, pending_answer)
-        await callback.message.edit_text("Ответ записан.")
+    await answers_repo.set_answer(db_pool, current_answer_id, pending_answer)
+    await callback.message.edit_text("Ответ принят.")
 
     is_last_base_question = (question_index == len(BASE_QUESTIONS) - 1) and not followup_done
 
@@ -387,7 +424,7 @@ async def confirm_answer(
             return
         await state.set_state(CandidateStates.waiting_github)
         await state.set_data({"candidate_id": candidate_id})
-        await callback.message.answer(MSG["GITHUB_REQUEST"])
+        await callback.message.answer(MSG["GITHUB_REQUEST"], reply_markup=_github_keyboard())
         return
 
     # ASYNC PATH for Q1–Q4: fire background analysis, immediately advance to next question
@@ -416,24 +453,35 @@ async def confirm_answer(
     await _advance_to_next(callback.message, state, db_pool, candidate_id, question_index)
 
 
-@router.callback_query(CandidateStates.confirming_answer, F.data == "answer:retry")
-async def retry_answer(
+@router.callback_query(CandidateStates.confirming_answer, F.data == "answer:edit")
+async def edit_answer(
     callback: CallbackQuery, state: FSMContext, db_pool: asyncpg.Pool
 ) -> None:
     data = await state.get_data()
-    question_text: str = data["current_question_text"]
+    pending_answer: str = data.get("pending_answer", "")
 
-    await state.update_data(pending_answer=None)
-    await callback.message.edit_text(MSG["ANSWER_RETRY"])
     await callback.answer()
-
-    await callback.message.answer(question_text)
+    await callback.message.edit_text(
+        MSG["ANSWER_EDIT"].format(answer=pending_answer),
+        parse_mode="HTML",
+    )
     await state.set_state(CandidateStates.answering)
 
 
 # ---------------------------------------------------------------------------
 # GitHub-ссылка
 # ---------------------------------------------------------------------------
+
+@router.callback_query(CandidateStates.waiting_github, F.data == "github:skip")
+async def skip_github(
+    callback: CallbackQuery, state: FSMContext, db_pool: asyncpg.Pool
+) -> None:
+    data = await state.get_data()
+    candidate_id: int = data["candidate_id"]
+    await callback.answer()
+    await callback.message.edit_text(MSG["GITHUB_SKIPPED"])
+    await _run_scoring(callback.message, state, db_pool, candidate_id, github_data=None)
+
 
 @router.message(CandidateStates.waiting_github)
 async def process_github_link(
@@ -468,44 +516,26 @@ async def process_github_link(
             readme_snippet=github_data["readme_snippet"],
         )
 
-    scoring_msg = await message.answer(MSG["SCORING_IN_PROGRESS"])
-    answers = await answers_repo.get_answers(db_pool, candidate_id)
-    answers_list = [
-        {"question": row["question_text"], "answer": row["answer_text"]}
-        for row in answers
-        if row["answer_text"]
-    ]
-    scoring = await _llm.generate_scoring(answers_list, github_data)
-    await scoring_msg.delete()
+        # Validate GitHub ownership against candidate's name
+        owner_login = github_data.get("owner_login", "")
+        if owner_login:
+            row = await db_pool.fetchrow(
+                "SELECT first_name, last_name FROM candidates WHERE id = $1", candidate_id
+            )
+            if row:
+                validation = await _llm.validate_github_ownership(
+                    candidate_first_name=row["first_name"],
+                    candidate_last_name=row["last_name"] or "",
+                    github_login=owner_login,
+                    github_display_name=github_data.get("owner_name"),
+                )
+                if validation is not None:
+                    if validation.get("is_owner", True):
+                        await message.answer(MSG["GITHUB_OWNERSHIP_VALID"])
+                    else:
+                        await message.answer(MSG["GITHUB_OWNERSHIP_WARN"])
 
-    if scoring:
-        total = (
-            scoring["task_decomposition"]["score"]
-            + scoring["prompting_tools"]["score"]
-            + scoring["critical_thinking"]["score"]
-        )
-        is_hot = total >= settings.HOT_THRESHOLD
-
-        await scoring_repo.insert_scoring_result(
-            db_pool,
-            candidate_id=candidate_id,
-            task_decomposition_score=scoring["task_decomposition"]["score"],
-            task_decomposition_reasoning=scoring["task_decomposition"]["reasoning"],
-            prompting_tools_score=scoring["prompting_tools"]["score"],
-            prompting_tools_reasoning=scoring["prompting_tools"]["reasoning"],
-            critical_thinking_score=scoring["critical_thinking"]["score"],
-            critical_thinking_reasoning=scoring["critical_thinking"]["reasoning"],
-            total_score=total,
-            summary=scoring.get("summary", ""),
-            recommendation=scoring.get("recommendation", "consider"),
-            is_hot=is_hot,
-        )
-
-        await candidates_repo.mark_scored(db_pool, candidate_id)
-        await _show_scoring(message, scoring, total, answers_list)
-
-    await state.set_state(CandidateStates.finished)
-    await message.answer(MSG["FAREWELL"])
+    await _run_scoring(message, state, db_pool, candidate_id, github_data=github_data)
 
 
 # ---------------------------------------------------------------------------
@@ -566,7 +596,7 @@ async def _advance_to_next(
     else:
         await state.set_state(CandidateStates.waiting_github)
         await state.set_data({"candidate_id": candidate_id})
-        await message.answer(MSG["GITHUB_REQUEST"])
+        await message.answer(MSG["GITHUB_REQUEST"], reply_markup=_github_keyboard())
 
 
 async def _background_analyze(
@@ -672,7 +702,7 @@ async def _wait_for_analyses_and_ask_followups(
     # No follow-ups → proceed to GitHub
     await state.set_state(CandidateStates.waiting_github)
     await state.set_data({"candidate_id": candidate_id})
-    await callback.message.answer(MSG["GITHUB_REQUEST"])
+    await callback.message.answer(MSG["GITHUB_REQUEST"], reply_markup=_github_keyboard())
 
 
 async def _resume_session(
@@ -712,29 +742,59 @@ async def _resume_session(
         await state.set_state(CandidateStates.waiting_github)
         await state.set_data({"candidate_id": candidate_id})
         await message.answer(MSG["SESSION_RESUMED"])
-        await message.answer(MSG["GITHUB_REQUEST"])
+        await message.answer(MSG["GITHUB_REQUEST"], reply_markup=_github_keyboard())
 
 
-async def _show_scoring(
+async def _run_scoring(
     message: Message,
-    scoring: dict,
-    total: int,
-    answers_list: list[dict],
+    state: FSMContext,
+    db_pool: asyncpg.Pool,
+    candidate_id: int,
+    github_data: dict | None,
 ) -> None:
-    await message.bot.send_chat_action(message.chat.id, "typing")
+    """Запрашивает LLM-скоринг, сохраняет результат и показывает кандидату."""
+    scoring_msg = await message.answer(MSG["SCORING_IN_PROGRESS"])
+    answers = await answers_repo.get_answers(db_pool, candidate_id)
+    answers_list = [
+        {"question": row["question_text"], "answer": row["answer_text"]}
+        for row in answers
+        if row["answer_text"]
+    ]
+    scoring = await _llm.generate_scoring(answers_list, github_data)
+    await scoring_msg.delete()
 
-    # Send Q+A blocks (base questions only — first 5 answered)
-    base_qas = [a for a in answers_list if a.get("answer")][:5]
-    for i, qa in enumerate(base_qas, 1):
-        await message.answer(
-            MSG["SCORING_QA_BLOCK"].format(
-                number=i,
-                question=qa["question"],
-                answer=qa["answer"],
-            )
+    if scoring:
+        total = min(
+            scoring["task_decomposition"]["score"]
+            + scoring["prompting_tools"]["score"]
+            + scoring["critical_thinking"]["score"],
+            30,
         )
+        is_hot = total >= settings.HOT_THRESHOLD
 
-    # One combined scoring message
+        await scoring_repo.insert_scoring_result(
+            db_pool,
+            candidate_id=candidate_id,
+            task_decomposition_score=scoring["task_decomposition"]["score"],
+            task_decomposition_reasoning=scoring["task_decomposition"]["reasoning"],
+            prompting_tools_score=scoring["prompting_tools"]["score"],
+            prompting_tools_reasoning=scoring["prompting_tools"]["reasoning"],
+            critical_thinking_score=scoring["critical_thinking"]["score"],
+            critical_thinking_reasoning=scoring["critical_thinking"]["reasoning"],
+            total_score=total,
+            summary=scoring.get("summary", ""),
+            recommendation=scoring.get("recommendation", "consider"),
+            is_hot=is_hot,
+        )
+        await candidates_repo.mark_scored(db_pool, candidate_id)
+        await _show_scoring(message, scoring, total)
+
+    await state.set_state(CandidateStates.finished)
+    await message.answer(MSG["FAREWELL"])
+
+
+async def _show_scoring(message: Message, scoring: dict, total: int) -> None:
+    await message.bot.send_chat_action(message.chat.id, "typing")
     await message.answer(
         MSG["SCORING_RESULT"].format(
             task_decomposition_score=scoring["task_decomposition"]["score"],

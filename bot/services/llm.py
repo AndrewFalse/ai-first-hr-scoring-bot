@@ -117,11 +117,18 @@ class LLMService:
 Ключевые оси для этого вопроса: {primary_axes_str}
 Уточняющий вопрос нужен ТОЛЬКО если оценка по ЛЮБОЙ из ключевых осей ≤ 3.
 
+Правила уточняющего вопроса (если нужен):
+- Ровно один вопрос, 1–2 предложения максимум
+- Нацелен на конкретную слабую область, которую кандидат не раскрыл
+- Не повторяет и не перефразирует вопросы из истории переписки
+- Не перечисляет несколько подвопросов через «или», «и», «а также»
+- Конкретный и узкий, а не широкий обзорный вопрос
+
 Верни ответ строго в формате JSON без markdown-обёртки:
 {{
   "feedback": "<2–4 предложения на русском, основанные на фактах ответа, без оценочных суждений типа 'хорошо' или 'плохо'>",
   "needs_followup": <true или false>,
-  "followup_question": "<целевой уточняющий вопрос на русском если needs_followup=true, иначе null>"
+  "followup_question": "<один конкретный вопрос 1–2 предложения на русском если needs_followup=true, иначе null>"
 }}"""
 
         user_content = f"Вопрос: {question}\n\nОтвет кандидата: {answer}"
@@ -130,6 +137,43 @@ class LLMService:
 
         raw = await self._call_llm(system_prompt, user_content)
         return self._parse_json(raw)
+
+    async def validate_github_ownership(
+        self,
+        candidate_first_name: str,
+        candidate_last_name: str,
+        github_login: str,
+        github_display_name: str | None,
+    ) -> dict[str, Any] | None:
+        """
+        Проверяет, совпадает ли GitHub-аккаунт с данными кандидата.
+        Использует лёгкую модель для быстрой валидации.
+        """
+        display = github_display_name or "не указано"
+        prompt = (
+            f"Кандидат:\n"
+            f"- Имя: {candidate_first_name}\n"
+            f"- Фамилия: {candidate_last_name}\n\n"
+            f"GitHub-аккаунт репозитория:\n"
+            f"- Username: {github_login}\n"
+            f"- Display name: {display}\n\n"
+            "Задача: определить, скорее всего ли этот GitHub принадлежит данному кандидату.\n"
+            "Учитывай транслитерацию, частичное совпадение, сокращения.\n"
+            "Если display name не указан — ориентируйся только на username.\n\n"
+            "Верни строго JSON без markdown:\n"
+            '{"is_owner": <true/false>, "confidence": "<high|medium|low>", "reason": "<1 предложение на русском>"}'
+        )
+        try:
+            response = await self._client.chat.completions.create(
+                model=settings.OPENROUTER_VALIDATION_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1,
+            )
+            raw = response.choices[0].message.content
+            return self._parse_json(raw)
+        except Exception:
+            logger.exception("GitHub ownership validation failed")
+            return None
 
     async def generate_scoring(
         self,
