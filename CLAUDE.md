@@ -1,11 +1,14 @@
 # HR-скрининг бот — Архитектура и стратегия реализации
 
+Ты - профессиональный Python-разработчик. Твоя задача реализовать продукт: Telegram бот для скоринга потенциальных кандидатов
+на вакансию AI-first инженер. Система должна быть актуально нв 2026 и работать на российский сегмент.
+
 ## Стек
 
 | Компонент | Выбор |
 |-----------|-------|
 | Telegram-бот | aiogram 3.x (Python) |
-| LLM-скоринг | Claude API (claude-sonnet) |
+| LLM-скоринг | OpenRouter API (доступ ко всем моделям) |
 | Хранение результатов | Google Sheets API |
 | Валидация ссылок | GitHub API (PyGithub) |
 | Деплой | Docker на локальном сервере |
@@ -124,6 +127,68 @@ hr-scoring-bot/
 ```
 
 Промпты вынесены в отдельный файл — их нужно итерировать отдельно от кода.
+
+---
+
+## База данных
+
+**Драйвер:** asyncpg (прямой async PostgreSQL, без ORM)
+
+**Схема:** `bot/db/init.sql` — выполняется автоматически при первом старте контейнера через `docker-entrypoint-initdb.d`.
+
+### Таблицы
+
+| Таблица | Назначение |
+|---------|-----------|
+| `admins` | Персистентный whitelist администраторов (заменяет in-memory `set[int]`) |
+| `candidates` | Одна строка = одна сессия скрининга |
+| `candidate_answers` | Все вопросы + ответы сессии (базовые и адаптивные от LLM) |
+| `github_analyses` | Данные репозитория кандидата (one-to-one с candidates) |
+| `scoring_results` | Итоговый скоринг LLM по трём критериям (one-to-one с candidates) |
+| `followup_questions` | 2-3 вопроса для живого собеседования от LLM |
+
+### Ключевые constraints
+
+- `idx_candidates_one_active` — partial unique index: запрет двух активных `in_progress` сессий у одного `telegram_id`
+- `chk_*_score` — CHECK: каждый критерий от 1 до 10, total от 3 до 30
+
+### Логика повторного прохождения
+
+- `in_progress` сессия существует → продолжить с того места
+- `scored` сессия существует → "вы уже прошли скрининг, мы с вами свяжемся"
+- Иначе → создать новую запись
+
+### Структура `bot/db/`
+
+```
+bot/db/
+├── __init__.py
+├── pool.py                  # create_pool() → asyncpg.Pool (min=2, max=10)
+├── init.sql                 # DDL-схема, монтируется в postgres-контейнер
+└── repositories/
+    ├── __init__.py
+    ├── admins.py            # is_admin(), add_admin() с upsert
+    ├── candidates.py        # create/get/update сессий, stats, top
+    ├── answers.py           # add_question(), set_answer(), get_answers()
+    ├── github.py            # upsert_github_analysis()
+    └── scoring.py           # insert_scoring_result(), insert_followup_questions()
+```
+
+### Интеграция с aiogram
+
+Pool создаётся в `on_startup`, закрывается в `on_shutdown`, передаётся через `dispatcher["db_pool"]`. Aiogram 3.x инжектирует его в хендлеры автоматически:
+
+```python
+async def cmd_start(message: Message, state: FSMContext, db_pool: asyncpg.Pool) -> None:
+    ...
+```
+
+### Переменные окружения
+
+```
+DB_PASSWORD=...
+DATABASE_URL=postgresql://bot:<password>@postgres:5432/hr_screening
+```
 
 ---
 
