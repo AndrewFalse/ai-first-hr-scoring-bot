@@ -6,6 +6,15 @@ from aiogram.fsm.state import StatesGroup, State
 
 
 class CandidateStates(StatesGroup):
-    answering = State()       # Кандидат отвечает на вопросы
-    waiting_github = State()  # Ожидание GitHub-ссылки
-    finished = State()        # Скрининг завершён
+    # Онбординг
+    waiting_contact   = State()  # Ожидание шаринга контакта
+    waiting_name      = State()  # Ввод ФИО
+    waiting_source    = State()  # Выбор источника (inline-кнопки)
+    confirming        = State()  # Подтверждение данных
+    # Пре-интервью
+    pre_interview      = State()  # Показана инструкция, ждём нажатия «Начать»
+    # Интервью
+    answering          = State()  # Кандидат отвечает на вопросы (текст или голос)
+    confirming_answer  = State()  # Ожидание подтверждения ответа кандидатом
+    waiting_github     = State()  # Ожидание GitHub-ссылки
+    finished           = State()  # Скрининг завершён
