@@ -1,21 +1,26 @@
 """
-Утилиты авторизации: проверка админских прав, whitelist.
+Утилиты авторизации: проверка админских прав через БД.
 """
 
+import asyncpg
+
 from bot.config import settings
-
-# In-memory whitelist (в проде можно заменить на файл/БД)
-_admin_whitelist: set[int] = set()
+from bot.db.repositories import admins as admins_repo
 
 
-def is_admin(user_id: int) -> bool:
-    """Проверка, есть ли user_id в whitelist админов."""
-    return user_id in _admin_whitelist
+async def is_admin(pool: asyncpg.Pool, user_id: int) -> bool:
+    """Проверка, есть ли user_id в таблице admins."""
+    return await admins_repo.is_admin(pool, user_id)
 
 
-def add_admin(user_id: int) -> None:
-    """Добавление user_id в whitelist."""
-    _admin_whitelist.add(user_id)
+async def add_admin(
+    pool: asyncpg.Pool,
+    user_id: int,
+    first_name: str,
+    username: str | None = None,
+) -> None:
+    """Добавление пользователя в таблицу admins."""
+    await admins_repo.add_admin(pool, user_id, first_name, username)
 
 
 def verify_admin_hash(command_hash: str) -> bool:

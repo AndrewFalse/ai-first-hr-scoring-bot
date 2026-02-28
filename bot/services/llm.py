@@ -1,19 +1,26 @@
 """
-Сервис для работы с Claude API.
+Сервис для работы с OpenRouter API (OpenAI-совместимый интерфейс).
 Анализ контекста ответов и генерация скоринга.
 """
 
 from typing import Any
 
+from openai import AsyncOpenAI
+
 from bot.config import settings
+
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
 
 class LLMService:
-    """Обёртка над Claude API для скоринга кандидатов."""
+    """Обёртка над OpenRouter API для скоринга кандидатов."""
 
     def __init__(self) -> None:
-        # TODO: инициализация клиента Anthropic
-        pass
+        self._client = AsyncOpenAI(
+            api_key=settings.OPENROUTER_API_KEY,
+            base_url=OPENROUTER_BASE_URL,
+        )
+        self._model = settings.OPENROUTER_MODEL
 
     async def analyze_answer(
         self, question: str, answer: str, context: list[dict[str, str]]
