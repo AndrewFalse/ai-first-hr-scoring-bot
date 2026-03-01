@@ -16,6 +16,13 @@ async def is_admin(pool: asyncpg.Pool, telegram_id: int) -> bool:
     return row is not None
 
 
+async def deactivate_admin(pool: asyncpg.Pool, telegram_id: int) -> None:
+    await pool.execute(
+        "UPDATE admins SET is_active = FALSE WHERE telegram_id = $1",
+        telegram_id,
+    )
+
+
 async def add_admin(
     pool: asyncpg.Pool,
     telegram_id: int,

@@ -1,5 +1,5 @@
 """
-Хэндлеры админа: авторизация, панель управления, сброс БД, тест транскрибации.
+Хэндлеры админа: авторизация, панель управления, сброс БД.
 """
 
 from __future__ import annotations
@@ -19,14 +19,12 @@ from bot.config import settings
 from bot.db.repositories import admins as admins_repo
 from bot.db.repositories import candidates as candidates_repo
 from bot.handlers.states import AdminStates
-from bot.services.voice import VoiceService
 
-_voice = VoiceService()
 router = Router(name="admin")
 
 
 # ---------------------------------------------------------------------------
-# Фильтр: только зарегистрированные администраторы
+# Фильтр: только для зарегистрированных администраторов
 # ---------------------------------------------------------------------------
 
 class IsAdmin(BaseFilter):
@@ -67,7 +65,7 @@ async def _dashboard_text(db_pool: asyncpg.Pool) -> str:
 
 
 # ---------------------------------------------------------------------------
-# /admin <пароль>
+# /admin <пароль> — вход в панель
 # ---------------------------------------------------------------------------
 
 @router.message(Command("admin"))
@@ -75,7 +73,7 @@ async def cmd_admin(
     message: Message, state: FSMContext, db_pool: asyncpg.Pool
 ) -> None:
     if not settings.ADMIN_SECRET:
-        await message.answer("❌ ADMIN_SECRET не настроен в .env.")
+        await message.answer("❌ Пароль администратора не настроен в .env.")
         return
 
     parts = message.text.split(maxsplit=1)
@@ -97,7 +95,7 @@ async def cmd_admin(
 
 
 # ---------------------------------------------------------------------------
-# /start для администратора — открывает панель, не кандидатский флоу
+# /start для администратора — открывает панель (не кандидатский флоу)
 # ---------------------------------------------------------------------------
 
 @router.message(CommandStart(), IsAdmin())
@@ -116,10 +114,7 @@ async def cmd_start_admin(
 # ---------------------------------------------------------------------------
 
 @router.message(Command("candidate"))
-async def cmd_switch_to_candidate(
-    message: Message, state: FSMContext, db_pool: asyncpg.Pool
-) -> None:
-    await admins_repo.deactivate_admin(db_pool, message.from_user.id)
+async def cmd_switch_to_candidate(message: Message, state: FSMContext) -> None:
     await state.clear()
     await message.answer(
         "Переключился в режим кандидата. Напиши /start чтобы начать скрининг."
@@ -165,31 +160,3 @@ async def confirm_reset(callback: CallbackQuery, db_pool: asyncpg.Pool) -> None:
         + await _dashboard_text(db_pool),
         reply_markup=_dashboard_keyboard(),
     )
-
-
-# ---------------------------------------------------------------------------
-# /test_voice — тест транскрибации (для отладки)
-# ---------------------------------------------------------------------------
-
-@router.message(Command("test_voice"))
-async def cmd_test_voice(message: Message, state: FSMContext) -> None:
-    await state.set_state(AdminStates.waiting_voice_test)
-    await message.answer("Отправь голосовое сообщение — я покажу транскрипцию.")
-
-
-@router.message(AdminStates.waiting_voice_test, F.voice)
-async def process_voice_test(message: Message, state: FSMContext) -> None:
-    await state.clear()
-    status = await message.answer("⏳ Транскрибирую...")
-    audio = await message.bot.download(message.voice.file_id)
-    result = await _voice.transcribe(audio, filename=f"voice_{message.voice.file_unique_id}.ogg")
-    await status.delete()
-    if result:
-        await message.answer(f"<b>Транскрипция:</b>\n\n{result}")
-    else:
-        await message.answer("❌ Транскрибация не удалась.")
-
-
-@router.message(AdminStates.waiting_voice_test)
-async def process_voice_test_wrong(message: Message) -> None:
-    await message.answer("Нужно голосовое сообщение.")

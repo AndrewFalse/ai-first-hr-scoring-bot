@@ -29,8 +29,7 @@ class Settings:
     GOOGLE_SHEET_ID: str = field(default_factory=lambda: getenv("GOOGLE_SHEET_ID", ""))
 
     # Admin
-    ADMIN_SECRET_HASH: str = field(default_factory=lambda: getenv("ADMIN_SECRET_HASH", ""))
-    INIT_ADMIN_SECRET: str = field(default_factory=lambda: getenv("INIT_ADMIN_SECRET", ""))
+    ADMIN_SECRET: str = field(default_factory=lambda: getenv("ADMIN_SECRET", ""))
     RECRUITER_CHAT_ID: str = field(default_factory=lambda: getenv("RECRUITER_CHAT_ID", ""))
 
     # Database

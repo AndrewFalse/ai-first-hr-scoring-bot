@@ -103,6 +103,24 @@ async def get_by_id(
     )
 
 
+async def get_screening_stats(pool: asyncpg.Pool) -> asyncpg.Record:
+    """Статистика прошедших скрининг для админ-панели."""
+    return await pool.fetchrow(
+        """
+        SELECT
+            COUNT(*) FILTER (WHERE status = 'scored')                                              AS total,
+            COUNT(*) FILTER (WHERE status = 'scored' AND DATE(finished_at) = CURRENT_DATE)        AS today,
+            COUNT(*) FILTER (WHERE status = 'scored' AND finished_at >= NOW() - INTERVAL '7 days') AS week
+        FROM candidates
+        """
+    )
+
+
+async def reset_candidates(pool: asyncpg.Pool) -> None:
+    """Удаляет всех кандидатов (CASCADE удалит ответы, скоринг, GitHub-данные)."""
+    await pool.execute("DELETE FROM candidates")
+
+
 async def get_stats(pool: asyncpg.Pool) -> asyncpg.Record:
     """Возвращает агрегированную статистику для админ-панели."""
     return await pool.fetchrow(

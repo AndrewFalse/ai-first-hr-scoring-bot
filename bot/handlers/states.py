@@ -6,6 +6,7 @@ from aiogram.fsm.state import StatesGroup, State
 
 
 class AdminStates(StatesGroup):
+    dashboard          = State()  # Открыта панель администратора
     waiting_voice_test = State()  # Ожидание голосового для теста транскрибации
 
 
