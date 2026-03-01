@@ -1,5 +1,5 @@
 """
-Хэндлеры админа: авторизация, панель управления, сброс БД, тест транскрибации.
+Хэндлеры админа: авторизация, панель управления, топ-3, порог уведомлений, сброс БД.
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ from aiogram.types import (
 from bot.config import settings
 from bot.db.repositories import admins as admins_repo
 from bot.db.repositories import candidates as candidates_repo
+from bot.db.repositories import settings as settings_repo
 from bot.handlers.states import AdminStates
 from bot.services.voice import VoiceService
 
@@ -39,9 +40,15 @@ class IsAdmin(BaseFilter):
 # ---------------------------------------------------------------------------
 
 def _dashboard_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="🗑 Сбросить базу данных", callback_data="admin:reset_db"),
-    ]])
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="📋 Топ-3 кандидата", callback_data="admin:top3"),
+            InlineKeyboardButton(text="⚙️ Изменить порог", callback_data="admin:set_threshold"),
+        ],
+        [
+            InlineKeyboardButton(text="🗑 Сбросить базу данных", callback_data="admin:reset_db"),
+        ],
+    ])
 
 
 def _confirm_reset_keyboard() -> InlineKeyboardMarkup:
@@ -51,18 +58,28 @@ def _confirm_reset_keyboard() -> InlineKeyboardMarkup:
     ]])
 
 
+def _back_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="← Назад", callback_data="admin:back"),
+    ]])
+
+
 # ---------------------------------------------------------------------------
 # Вспомогательные функции
 # ---------------------------------------------------------------------------
 
 async def _dashboard_text(db_pool: asyncpg.Pool) -> str:
     stats = await candidates_repo.get_screening_stats(db_pool)
+    threshold = await settings_repo.get_setting(db_pool, "hot_threshold", "7.0")
+    avg = stats["avg_score"] if stats["avg_score"] is not None else "—"
     return (
         "👑 <b>Панель администратора</b>\n\n"
         "📊 <b>Прошло скрининг:</b>\n"
         f"• Всего: <b>{stats['total']}</b>\n"
         f"• Сегодня: <b>{stats['today']}</b>\n"
-        f"• За 7 дней: <b>{stats['week']}</b>"
+        f"• За 7 дней: <b>{stats['week']}</b>\n"
+        f"• Средний балл: <b>{avg}/10</b>\n\n"
+        f"⚙️ Порог уведомлений: <b>{threshold}/10</b>"
     )
 
 
@@ -97,7 +114,7 @@ async def cmd_admin(
 
 
 # ---------------------------------------------------------------------------
-# /start для администратора — открывает панель, не кандидатский флоу
+# /start для администратора
 # ---------------------------------------------------------------------------
 
 @router.message(CommandStart(), IsAdmin())
@@ -127,7 +144,92 @@ async def cmd_switch_to_candidate(
 
 
 # ---------------------------------------------------------------------------
-# Кнопки дашборда
+# Кнопка «Топ-3 кандидата»
+# ---------------------------------------------------------------------------
+
+@router.callback_query(AdminStates.dashboard, F.data == "admin:top3")
+async def show_top3(callback: CallbackQuery, db_pool: asyncpg.Pool) -> None:
+    await callback.answer()
+    top = await candidates_repo.get_top_candidates(db_pool, limit=3)
+
+    if not top:
+        await callback.message.edit_text(
+            "Пока нет кандидатов с результатами.",
+            reply_markup=_back_keyboard(),
+        )
+        return
+
+    medals = ["🥇", "🥈", "🥉"]
+    lines = ["📋 <b>Топ-3 кандидата</b>\n"]
+    for i, c in enumerate(top):
+        name = f"{c['first_name']} {c['last_name'] or ''}".strip()
+        contact = f"@{c['username']}" if c["username"] else name
+        phone = c["phone_number"] or "не указан"
+        avg = round(c["total_score"] / 3, 1)
+        summary = (c["summary"] or "")[:120]
+        lines.append(
+            f"{medals[i]} <b>{contact}</b> | {phone} | <b>{avg}/10</b>\n"
+            f"   <i>{summary}</i>"
+        )
+
+    await callback.message.edit_text(
+        "\n\n".join(lines),
+        reply_markup=_back_keyboard(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Кнопка «Изменить порог»
+# ---------------------------------------------------------------------------
+
+@router.callback_query(AdminStates.dashboard, F.data == "admin:set_threshold")
+async def prompt_threshold(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    await state.set_state(AdminStates.setting_threshold)
+    await callback.message.edit_text(
+        "⚙️ Введи новый порог уведомлений (от <b>0.0</b> до <b>10.0</b>):\n\n"
+        "Кандидаты со средним баллом ≥ порога будут отправляться в чат рекрутеров.",
+        reply_markup=_back_keyboard(),
+    )
+
+
+@router.message(AdminStates.setting_threshold, F.text)
+async def save_threshold(
+    message: Message, state: FSMContext, db_pool: asyncpg.Pool
+) -> None:
+    try:
+        value = round(float(message.text.replace(",", ".")), 1)
+        if not (0.0 <= value <= 10.0):
+            raise ValueError
+    except ValueError:
+        await message.answer("Введи число от 0.0 до 10.0 (например: 7.5)")
+        return
+
+    await settings_repo.set_setting(db_pool, "hot_threshold", str(value))
+    await state.set_state(AdminStates.dashboard)
+    await message.answer(
+        f"✅ Порог установлен: <b>{value}/10</b>\n\n"
+        + await _dashboard_text(db_pool),
+        reply_markup=_dashboard_keyboard(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Кнопка «Назад»
+# ---------------------------------------------------------------------------
+
+@router.callback_query(F.data == "admin:back")
+async def go_back(callback: CallbackQuery, state: FSMContext, db_pool: asyncpg.Pool) -> None:
+    await callback.answer()
+    await state.set_state(AdminStates.dashboard)
+    await callback.message.edit_text(
+        await _dashboard_text(db_pool),
+        reply_markup=_dashboard_keyboard(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Кнопка «Сбросить БД»
 # ---------------------------------------------------------------------------
 
 @router.callback_query(AdminStates.dashboard, F.data == "admin:reset_db")
@@ -168,7 +270,7 @@ async def confirm_reset(callback: CallbackQuery, db_pool: asyncpg.Pool) -> None:
 
 
 # ---------------------------------------------------------------------------
-# /test_voice — тест транскрибации (для отладки)
+# /test_voice — тест транскрибации
 # ---------------------------------------------------------------------------
 
 @router.message(Command("test_voice"))

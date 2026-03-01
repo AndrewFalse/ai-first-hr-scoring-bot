@@ -29,6 +29,7 @@ from bot.db.repositories import candidates as candidates_repo
 from bot.db.repositories import github as github_repo
 from bot.db.repositories import question_analyses as question_analyses_repo
 from bot.db.repositories import scoring as scoring_repo
+from bot.db.repositories import settings as settings_repo
 from bot.handlers.states import CandidateStates, SupportStates
 from bot.config import settings
 from bot.services.github import GitHubService
@@ -880,6 +881,58 @@ async def _background_export(
         logger.exception("Background export failed for candidate=%d", candidate_id)
 
 
+async def _notify_recruiters(
+    db_pool: asyncpg.Pool,
+    bot,
+    candidate_id: int,
+    avg: float,
+    summary: str,
+) -> None:
+    """Отправляет уведомление в чат рекрутеров если avg >= порога."""
+    try:
+        threshold = float(await settings_repo.get_setting(db_pool, "hot_threshold", "7.0"))
+        if avg < threshold:
+            return
+
+        row = await db_pool.fetchrow(
+            "SELECT first_name, last_name, username, phone_number FROM candidates WHERE id = $1",
+            candidate_id,
+        )
+        if not row:
+            return
+
+        name = f"{row['first_name']} {row['last_name'] or ''}".strip()
+        username = f"@{row['username']}" if row["username"] else name
+        phone = row["phone_number"] or "не указан"
+
+        sheet_url = ""
+        if settings.GOOGLE_SHEET_ID:
+            sheet_url = f"https://docs.google.com/spreadsheets/d/{settings.GOOGLE_SHEET_ID}"
+
+        text = (
+            f"🔔 <b>Новый кандидат прошёл скоринг!</b>\n\n"
+            f"👤 {name} ({username})\n"
+            f"📱 {phone}\n"
+            f"⭐ Средний балл: <b>{avg}/10</b>\n\n"
+            f"📝 {summary}"
+        )
+
+        from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+        keyboard = None
+        if sheet_url:
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="→ Открыть Google Таблицу", url=sheet_url),
+            ]])
+
+        await bot.send_message(
+            settings.RECRUITER_CHAT_ID,
+            text,
+            reply_markup=keyboard,
+        )
+    except Exception:
+        logger.exception("Failed to notify recruiters for candidate=%d", candidate_id)
+
+
 async def _run_scoring(
     message: Message,
     state: FSMContext,
@@ -943,6 +996,16 @@ async def _run_scoring(
             is_hot=is_hot,
         )
         await candidates_repo.mark_scored(db_pool, candidate_id)
+
+        # Уведомление рекрутерам если avg >= порога
+        if settings.RECRUITER_CHAT_ID:
+            asyncio.create_task(_notify_recruiters(
+                db_pool=db_pool,
+                bot=message.bot,
+                candidate_id=candidate_id,
+                avg=avg,
+                summary=scoring.get("summary", ""),
+            ))
 
         github_section = _build_github_section(github_description, ownership_result)
         await _show_scoring(message, scoring, avg, github_section)

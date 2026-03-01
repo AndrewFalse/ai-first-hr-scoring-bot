@@ -108,11 +108,30 @@ async def get_screening_stats(pool: asyncpg.Pool) -> asyncpg.Record:
     return await pool.fetchrow(
         """
         SELECT
-            COUNT(*) FILTER (WHERE status = 'scored')                                              AS total,
-            COUNT(*) FILTER (WHERE status = 'scored' AND DATE(finished_at) = CURRENT_DATE)        AS today,
-            COUNT(*) FILTER (WHERE status = 'scored' AND finished_at >= NOW() - INTERVAL '7 days') AS week
-        FROM candidates
+            COUNT(*) FILTER (WHERE c.status = 'scored')                                              AS total,
+            COUNT(*) FILTER (WHERE c.status = 'scored' AND DATE(c.finished_at) = CURRENT_DATE)      AS today,
+            COUNT(*) FILTER (WHERE c.status = 'scored' AND c.finished_at >= NOW() - INTERVAL '7 days') AS week,
+            ROUND(AVG(sr.total_score)::NUMERIC / 3, 1) AS avg_score
+        FROM candidates c
+        LEFT JOIN scoring_results sr ON sr.candidate_id = c.id AND c.status = 'scored'
         """
+    )
+
+
+async def get_top_candidates(pool: asyncpg.Pool, limit: int = 3) -> list[asyncpg.Record]:
+    """Топ кандидатов по среднему баллу (avg/10)."""
+    return await pool.fetch(
+        """
+        SELECT
+            c.first_name, c.last_name, c.username, c.phone_number,
+            sr.total_score, sr.summary
+        FROM candidates c
+        JOIN scoring_results sr ON sr.candidate_id = c.id
+        WHERE c.status = 'scored'
+        ORDER BY sr.total_score DESC
+        LIMIT $1
+        """,
+        limit,
     )
 
 

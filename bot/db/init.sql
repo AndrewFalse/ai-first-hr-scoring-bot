@@ -98,3 +98,10 @@ CREATE TABLE scoring_results (
 );
 CREATE INDEX idx_scoring_total_score ON scoring_results (total_score DESC);
 CREATE INDEX idx_scoring_is_hot      ON scoring_results (is_hot) WHERE is_hot = TRUE;
+
+-- Persistent bot settings (key-value)
+CREATE TABLE bot_settings (
+    key   VARCHAR(64) PRIMARY KEY,
+    value TEXT        NOT NULL
+);
+INSERT INTO bot_settings (key, value) VALUES ('hot_threshold', '7.0');
