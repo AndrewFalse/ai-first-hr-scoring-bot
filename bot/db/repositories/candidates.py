@@ -64,6 +64,17 @@ async def set_phone(pool: asyncpg.Pool, candidate_id: int, phone: str) -> None:
     )
 
 
+async def delete_sessions(pool: asyncpg.Pool, telegram_id: int) -> int:
+    """Удаляет все сессии кандидата (CASCADE удаляет ответы, скоринг и пр.).
+    Возвращает количество удалённых строк."""
+    result = await pool.execute(
+        "DELETE FROM candidates WHERE telegram_id = $1",
+        telegram_id,
+    )
+    # asyncpg возвращает строку вида "DELETE N"
+    return int(result.split()[-1])
+
+
 async def set_source(pool: asyncpg.Pool, candidate_id: int, source: str) -> None:
     """source: 'hh' | 'telegram' | 'other'"""
     await pool.execute(

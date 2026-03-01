@@ -1,0 +1,61 @@
+## DASHBOARD
+<b>Панель администратора</b>
+
+Всего кандидатов: {total}
+Прошли скрининг: {scored}
+Средний скор: {avg_score}
+Hot-кандидаты: {hot_count}
+
+## ACCESS_DENIED
+Доступ запрещён.
+
+## INIT_USAGE
+Использование: <code>/init_admin &lt;secret_key&gt;</code>
+
+## INIT_WRONG_KEY
+Неверный ключ. Попробуй ещё раз.
+
+## INIT_SUCCESS
+Ты добавлен в список администраторов.
+
+## INIT_ALREADY
+Ты уже являешься администратором.
+
+## TOP_HEADER
+<b>Топ-3 кандидата:</b>
+
+## TOP_CANDIDATE
+{index}. <b>{name}</b> — {score}/50{hot_badge}
+{summary}
+
+## TOP_EMPTY
+Пока нет кандидатов с результатами.
+
+## CANDIDATE_USAGE
+Использование: <code>/candidate &lt;id&gt;</code>
+
+## CANDIDATE_NOT_FOUND
+Кандидат с таким ID не найден.
+
+## CANDIDATE_CARD
+<b>Кандидат #{id}</b>
+Имя: {name}
+Скор: {total}/50{hot_badge}
+
+<b>Ответы:</b>
+{answers}
+
+<b>Скоринг:</b>
+{scoring}
+
+## EXPORT_STARTED
+⏳ Экспортирую данные в Google Sheets...
+
+## EXPORT_SUCCESS
+Готово! Данные выгружены в таблицу.
+
+## EXPORT_FAILED
+Ошибка при экспорте. Проверь настройки Google Sheets API.
+
+## NO_ADMIN_ACCESS
+Эта команда доступна только администраторам.

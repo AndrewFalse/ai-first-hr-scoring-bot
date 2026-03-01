@@ -66,3 +66,32 @@ async def get_next_seq_number(pool: asyncpg.Pool, candidate_id: int) -> int:
         candidate_id,
     )
     return row["next"]
+
+
+async def get_unanswered_question(
+    pool: asyncpg.Pool, candidate_id: int
+) -> asyncpg.Record | None:
+    """Возвращает первый вопрос без ответа (для восстановления сессии)."""
+    return await pool.fetchrow(
+        """
+        SELECT id, seq_number, question_text, is_adaptive
+        FROM candidate_answers
+        WHERE candidate_id = $1 AND answer_text IS NULL
+        ORDER BY seq_number
+        LIMIT 1
+        """,
+        candidate_id,
+    )
+
+
+async def count_answered_base(pool: asyncpg.Pool, candidate_id: int) -> int:
+    """Считает количество отвеченных базовых (не адаптивных) вопросов."""
+    row = await pool.fetchrow(
+        """
+        SELECT COUNT(*) AS cnt
+        FROM candidate_answers
+        WHERE candidate_id = $1 AND is_adaptive = FALSE AND answer_text IS NOT NULL
+        """,
+        candidate_id,
+    )
+    return row["cnt"]
