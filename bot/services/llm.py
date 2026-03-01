@@ -138,6 +138,73 @@ class LLMService:
         raw = await self._call_llm(system_prompt, user_content)
         return self._parse_json(raw)
 
+    async def generate_interview_questions(
+        self,
+        answers: list[dict[str, str]],
+        scoring: dict[str, Any],
+    ) -> list[str]:
+        """
+        Генерирует 1–2 вопроса для живого собеседования на основе ответов и скоринга.
+        Нацелены на слабые места кандидата.
+        """
+        scoring_summary = (
+            f"Декомпозиция: {scoring['task_decomposition']['score']}/10 — "
+            f"{scoring['task_decomposition']['reasoning']}\n"
+            f"Промптинг+инструменты: {scoring['prompting_tools']['score']}/10 — "
+            f"{scoring['prompting_tools']['reasoning']}\n"
+            f"Критическое мышление: {scoring['critical_thinking']['score']}/10 — "
+            f"{scoring['critical_thinking']['reasoning']}"
+        )
+        answers_str = "\n\n".join(
+            f"Вопрос: {a['question']}\nОтвет: {a['answer']}"
+            for a in answers
+            if a.get("answer")
+        )
+        system = (
+            "Ты — технический рекрутер. Сформулируй 1–2 вопроса для живого собеседования "
+            "с кандидатом на позицию AI Automation Engineer.\n"
+            "Вопросы должны:\n"
+            "- Углублять именно слабые места, выявленные скорингом\n"
+            "- Быть конкретными, не общими\n"
+            "- Помочь рекрутеру лучше понять реальный опыт кандидата\n"
+            "- Быть сформулированы как вопросы к кандидату, а не как задания\n\n"
+            'Верни JSON без markdown: {"questions": ["вопрос 1", "вопрос 2"]}'
+        )
+        user = f"Ответы кандидата:\n{answers_str}\n\nРезультаты скоринга:\n{scoring_summary}"
+        raw = await self._call_llm(system, user)
+        result = self._parse_json(raw)
+        if result and isinstance(result.get("questions"), list):
+            return [q for q in result["questions"] if q][:2]
+        return []
+
+    async def generate_github_description(
+        self,
+        github_data: dict,
+    ) -> str | None:
+        """Генерирует краткое описание GitHub-репозитория кандидата (1–2 предложения)."""
+        has_readme = "есть" if github_data.get("has_readme") else "нет"
+        prompt = (
+            f"Репозиторий кандидата:\n"
+            f"- Язык: {github_data.get('primary_language') or 'не определён'}\n"
+            f"- Коммитов: {github_data.get('commit_count', 0)}\n"
+            f"- README: {has_readme}\n"
+            f"- Последний коммит: {github_data.get('last_commit_at') or 'неизвестно'}\n"
+            f"- Фрагмент README: {github_data.get('readme_snippet') or 'нет'}\n\n"
+            "Напиши краткое описание этого репозитория в 1–2 предложения на русском: "
+            "что это за проект, насколько он живой и серьёзный. "
+            "Без упоминания URL. Только текст, без JSON."
+        )
+        try:
+            response = await self._client.chat.completions.create(
+                model=settings.OPENROUTER_VALIDATION_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3,
+            )
+            return (response.choices[0].message.content or "").strip() or None
+        except Exception:
+            logger.exception("GitHub description generation failed")
+            return None
+
     async def validate_github_ownership(
         self,
         candidate_first_name: str,

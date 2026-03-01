@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 
@@ -32,6 +33,7 @@ from bot.handlers.states import CandidateStates, SupportStates
 from bot.config import settings
 from bot.services.github import GitHubService
 from bot.services.llm import LLMService
+from bot.services.sheets import SheetsService
 from bot.services.voice import VoiceService
 from bot.utils.messages import load_messages
 from bot.utils.validators import is_valid_full_name, parse_full_name
@@ -60,6 +62,7 @@ _VOICE_LIMIT_SECONDS = 120
 _llm = LLMService()
 _github = GitHubService()
 _voice = VoiceService()
+_sheets = SheetsService()
 
 # Module-level: background analysis tasks per candidate_id
 _analysis_tasks: dict[int, list[asyncio.Task]] = {}
@@ -107,8 +110,8 @@ def _start_keyboard() -> InlineKeyboardMarkup:
 
 def _answer_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✏️ Изменить", callback_data="answer:edit"),
-        InlineKeyboardButton(text="✅ Отправить", callback_data="answer:submit"),
+        InlineKeyboardButton(text="Изменить", callback_data="answer:edit"),
+        InlineKeyboardButton(text="Отправить", callback_data="answer:submit"),
     ]])
 
 
@@ -116,6 +119,68 @@ def _github_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="⏭ Пропустить", callback_data="github:skip"),
     ]])
+
+
+# ---------------------------------------------------------------------------
+# Утилиты: typing-loop, GitHub helpers, send_github_request
+# ---------------------------------------------------------------------------
+
+async def _keep_typing(chat_id: int, bot, stop: asyncio.Event) -> None:
+    """Повторяет typing action каждые 5 секунд пока stop не установлен."""
+    while not stop.is_set():
+        await bot.send_chat_action(chat_id, "typing")
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=5.0)
+        except asyncio.TimeoutError:
+            pass
+
+
+async def _check_github_ownership(
+    db_pool: asyncpg.Pool,
+    candidate_id: int,
+    github_data: dict,
+) -> dict | None:
+    owner_login = github_data.get("owner_login", "")
+    if not owner_login:
+        return None
+    row = await db_pool.fetchrow(
+        "SELECT first_name, last_name FROM candidates WHERE id = $1", candidate_id
+    )
+    if not row:
+        return None
+    return await _llm.validate_github_ownership(
+        candidate_first_name=row["first_name"],
+        candidate_last_name=row["last_name"] or "",
+        github_login=owner_login,
+        github_display_name=github_data.get("owner_name"),
+    )
+
+
+def _build_github_section(
+    github_description: str | None,
+    ownership_result: dict | None,
+) -> str:
+    if not github_description:
+        return ""
+    section = f"🔗 <b>GitHub:</b> {github_description}"
+    if ownership_result and not ownership_result.get("is_owner", True):
+        section += (
+            "\n\n⚠️ Обрати внимание: есть вероятность, что указанный репозиторий "
+            "не является личным."
+        )
+    return section
+
+
+async def _send_github_request(
+    message: Message,
+    state: FSMContext,
+    candidate_id: int,
+) -> None:
+    """Отправляет запрос GitHub-ссылки и сохраняет message_id в состоянии."""
+    await state.set_state(CandidateStates.waiting_github)
+    await state.set_data({"candidate_id": candidate_id})
+    msg = await message.answer(MSG["GITHUB_REQUEST"], reply_markup=_github_keyboard())
+    await state.update_data(github_request_msg_id=msg.message_id)
 
 
 # ---------------------------------------------------------------------------
@@ -422,9 +487,7 @@ async def confirm_answer(
             await state.set_state(CandidateStates.answering)
             await callback.message.answer(fup_text)
             return
-        await state.set_state(CandidateStates.waiting_github)
-        await state.set_data({"candidate_id": candidate_id})
-        await callback.message.answer(MSG["GITHUB_REQUEST"], reply_markup=_github_keyboard())
+        await _send_github_request(callback.message, state, candidate_id)
         return
 
     # ASYNC PATH for Q1–Q4: fire background analysis, immediately advance to next question
@@ -495,8 +558,20 @@ async def process_github_link(
         await message.answer(MSG["GITHUB_INVALID"])
         return
 
+    # Редактируем сообщение с запросом GitHub → "Ссылка получена."
+    github_request_msg_id = data.get("github_request_msg_id")
+    if github_request_msg_id:
+        try:
+            await message.bot.edit_message_text(
+                MSG["GITHUB_RECEIVED"],
+                chat_id=message.chat.id,
+                message_id=github_request_msg_id,
+            )
+        except Exception:
+            pass
+
     validating_msg = await message.answer(MSG["VALIDATING_REPO"])
-    is_valid, error_msg = await _github.validate_url(url)
+    is_valid, _ = await _github.validate_url(url)
     await validating_msg.delete()
 
     if not is_valid:
@@ -515,25 +590,6 @@ async def process_github_link(
             last_commit_at=github_data["last_commit_at"],
             readme_snippet=github_data["readme_snippet"],
         )
-
-        # Validate GitHub ownership against candidate's name
-        owner_login = github_data.get("owner_login", "")
-        if owner_login:
-            row = await db_pool.fetchrow(
-                "SELECT first_name, last_name FROM candidates WHERE id = $1", candidate_id
-            )
-            if row:
-                validation = await _llm.validate_github_ownership(
-                    candidate_first_name=row["first_name"],
-                    candidate_last_name=row["last_name"] or "",
-                    github_login=owner_login,
-                    github_display_name=github_data.get("owner_name"),
-                )
-                if validation is not None:
-                    if validation.get("is_owner", True):
-                        await message.answer(MSG["GITHUB_OWNERSHIP_VALID"])
-                    else:
-                        await message.answer(MSG["GITHUB_OWNERSHIP_WARN"])
 
     await _run_scoring(message, state, db_pool, candidate_id, github_data=github_data)
 
@@ -594,9 +650,7 @@ async def _advance_to_next(
     if next_index < len(BASE_QUESTIONS):
         await _ask_base_question(message, state, db_pool, candidate_id, next_index)
     else:
-        await state.set_state(CandidateStates.waiting_github)
-        await state.set_data({"candidate_id": candidate_id})
-        await message.answer(MSG["GITHUB_REQUEST"], reply_markup=_github_keyboard())
+        await _send_github_request(message, state, candidate_id)
 
 
 async def _background_analyze(
@@ -646,31 +700,37 @@ async def _wait_for_analyses_and_ask_followups(
     5. Задаёт follow-up вопросы или переходит к GitHub
     """
     analyzing_msg = await callback.message.answer(MSG["ANALYZING_ANSWERS"])
-    await callback.bot.send_chat_action(callback.message.chat.id, "typing")
 
-    history = [
-        {"question": row["question_text"], "answer": row["answer_text"]}
-        for row in await answers_repo.get_answers(db_pool, candidate_id)
-        if row["answer_text"]
-    ]
-    primary_axes = _PRIMARY_AXES[question_index]
-    q5_result = await _llm.analyze_answer(question_text, last_answer, history, primary_axes)
-    if q5_result:
-        await question_analyses_repo.insert_question_analysis(
-            db_pool,
-            candidate_id=candidate_id,
-            question_seq=question_seq,
-            feedback_text=q5_result.get("feedback", ""),
-            needs_followup=q5_result.get("needs_followup", False),
-            followup_text=q5_result.get("followup_question"),
-        )
+    stop_typing = asyncio.Event()
+    typing_task = asyncio.create_task(
+        _keep_typing(callback.message.chat.id, callback.bot, stop_typing)
+    )
+    try:
+        history = [
+            {"question": row["question_text"], "answer": row["answer_text"]}
+            for row in await answers_repo.get_answers(db_pool, candidate_id)
+            if row["answer_text"]
+        ]
+        primary_axes = _PRIMARY_AXES[question_index]
+        q5_result = await _llm.analyze_answer(question_text, last_answer, history, primary_axes)
+        if q5_result:
+            await question_analyses_repo.insert_question_analysis(
+                db_pool,
+                candidate_id=candidate_id,
+                question_seq=question_seq,
+                feedback_text=q5_result.get("feedback", ""),
+                needs_followup=q5_result.get("needs_followup", False),
+                followup_text=q5_result.get("followup_question"),
+            )
 
-    # Wait for any still-running Q1-Q4 background tasks
-    pending = list(_analysis_tasks.get(candidate_id, []))
-    if pending:
-        await asyncio.gather(*pending, return_exceptions=True)
-
-    await analyzing_msg.delete()
+        # Wait for any still-running Q1-Q4 background tasks
+        pending = list(_analysis_tasks.get(candidate_id, []))
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+    finally:
+        stop_typing.set()
+        typing_task.cancel()
+        await analyzing_msg.delete()
 
     # Collect follow-up queue (max 2 total)
     followups = await question_analyses_repo.get_pending_followups(db_pool, candidate_id)
@@ -700,9 +760,7 @@ async def _wait_for_analyses_and_ask_followups(
         return
 
     # No follow-ups → proceed to GitHub
-    await state.set_state(CandidateStates.waiting_github)
-    await state.set_data({"candidate_id": candidate_id})
-    await callback.message.answer(MSG["GITHUB_REQUEST"], reply_markup=_github_keyboard())
+    await _send_github_request(callback.message, state, candidate_id)
 
 
 async def _resume_session(
@@ -739,10 +797,87 @@ async def _resume_session(
 
     answered_base = await answers_repo.count_answered_base(db_pool, candidate_id)
     if answered_base >= len(BASE_QUESTIONS):
-        await state.set_state(CandidateStates.waiting_github)
-        await state.set_data({"candidate_id": candidate_id})
         await message.answer(MSG["SESSION_RESUMED"])
-        await message.answer(MSG["GITHUB_REQUEST"], reply_markup=_github_keyboard())
+        await _send_github_request(message, state, candidate_id)
+
+
+async def _background_export(
+    db_pool: asyncpg.Pool,
+    candidate_id: int,
+    scoring: dict,
+    total: int,
+    github_data: dict | None,
+    answers_list: list[dict],
+    github_description: str = "",
+) -> None:
+    """Генерирует вопросы для интервью и экспортирует всё в Google Sheets."""
+    try:
+        # Параллельно генерируем вопросы для интервью и описание GitHub
+        interview_questions = await _llm.generate_interview_questions(answers_list, scoring)
+
+        candidate_row = await db_pool.fetchrow(
+            "SELECT * FROM candidates WHERE id = $1", candidate_id
+        )
+        raw_answers = await answers_repo.get_answers(db_pool, candidate_id)
+
+        base_qas = [r for r in raw_answers if not r["is_adaptive"] and r["answer_text"]][:5]
+        followup_qas = [r for r in raw_answers if r["is_adaptive"] and r["answer_text"]][:2]
+
+        now = datetime.now().strftime("%Y-%m-%d %H:%M")
+        row: list = [
+            now,
+            str(candidate_row["telegram_id"]),
+            candidate_row["username"] or "",
+            candidate_row["first_name"],
+            candidate_row["last_name"] or "",
+            candidate_row["patronymic"] or "",
+            candidate_row["phone_number"] or "",
+            candidate_row["source"] or "",
+        ]
+
+        for i in range(5):
+            if i < len(base_qas):
+                row.extend([base_qas[i]["question_text"], base_qas[i]["answer_text"]])
+            else:
+                row.extend(["", ""])
+
+        for i in range(2):
+            if i < len(followup_qas):
+                row.extend([followup_qas[i]["question_text"], followup_qas[i]["answer_text"]])
+            else:
+                row.extend(["", ""])
+
+        # Скоринг без рекомендации
+        row.extend([
+            scoring["task_decomposition"]["score"],
+            scoring["task_decomposition"]["reasoning"],
+            scoring["prompting_tools"]["score"],
+            scoring["prompting_tools"]["reasoning"],
+            scoring["critical_thinking"]["score"],
+            scoring["critical_thinking"]["reasoning"],
+            total,
+            scoring.get("summary", ""),
+        ])
+
+        # GitHub
+        row.extend([
+            github_data.get("repo_url", "") if github_data else "",
+            github_data.get("primary_language", "") if github_data else "",
+            str(github_data.get("commit_count", "")) if github_data else "",
+            github_description,  # passed as param from _run_scoring
+        ])
+
+        # Вопросы для интервью — одна ячейка
+        if interview_questions:
+            q_lines = [f"{i}. {q}" for i, q in enumerate(interview_questions, 1)]
+            interview_cell = "Потенциальные вопросы для собеседования:\n" + "\n".join(q_lines)
+        else:
+            interview_cell = ""
+        row.append(interview_cell)
+
+        await _sheets.export_candidate(row)
+    except Exception:
+        logger.exception("Background export failed for candidate=%d", candidate_id)
 
 
 async def _run_scoring(
@@ -752,16 +887,36 @@ async def _run_scoring(
     candidate_id: int,
     github_data: dict | None,
 ) -> None:
-    """Запрашивает LLM-скоринг, сохраняет результат и показывает кандидату."""
+    """Запрашивает LLM-скоринг параллельно с GitHub-анализом, показывает результат."""
     scoring_msg = await message.answer(MSG["SCORING_IN_PROGRESS"])
-    answers = await answers_repo.get_answers(db_pool, candidate_id)
-    answers_list = [
-        {"question": row["question_text"], "answer": row["answer_text"]}
-        for row in answers
-        if row["answer_text"]
-    ]
-    scoring = await _llm.generate_scoring(answers_list, github_data)
-    await scoring_msg.delete()
+    stop_typing = asyncio.Event()
+    typing_task = asyncio.create_task(_keep_typing(message.chat.id, message.bot, stop_typing))
+
+    try:
+        answers = await answers_repo.get_answers(db_pool, candidate_id)
+        answers_list = [
+            {"question": row["question_text"], "answer": row["answer_text"]}
+            for row in answers
+            if row["answer_text"]
+        ]
+        if github_data:
+            results = await asyncio.gather(
+                _llm.generate_scoring(answers_list, github_data),
+                _llm.generate_github_description(github_data),
+                _check_github_ownership(db_pool, candidate_id, github_data),
+                return_exceptions=True,
+            )
+            scoring = results[0] if not isinstance(results[0], Exception) else None
+            github_description = results[1] if not isinstance(results[1], Exception) else None
+            ownership_result = results[2] if not isinstance(results[2], Exception) else None
+        else:
+            scoring = await _llm.generate_scoring(answers_list, None)
+            github_description = None
+            ownership_result = None
+    finally:
+        stop_typing.set()
+        typing_task.cancel()
+        await scoring_msg.delete()
 
     if scoring:
         total = min(
@@ -770,6 +925,7 @@ async def _run_scoring(
             + scoring["critical_thinking"]["score"],
             30,
         )
+        avg = round(total / 3, 1)
         is_hot = total >= settings.HOT_THRESHOLD
 
         await scoring_repo.insert_scoring_result(
@@ -787,23 +943,40 @@ async def _run_scoring(
             is_hot=is_hot,
         )
         await candidates_repo.mark_scored(db_pool, candidate_id)
-        await _show_scoring(message, scoring, total)
+
+        github_section = _build_github_section(github_description, ownership_result)
+        await _show_scoring(message, scoring, avg, github_section)
+
+        asyncio.create_task(_background_export(
+            db_pool=db_pool,
+            candidate_id=candidate_id,
+            scoring=scoring,
+            total=total,
+            github_data=github_data,
+            answers_list=answers_list,
+            github_description=github_description or "",
+        ))
 
     await state.set_state(CandidateStates.finished)
     await message.answer(MSG["FAREWELL"])
 
 
-async def _show_scoring(message: Message, scoring: dict, total: int) -> None:
-    await message.bot.send_chat_action(message.chat.id, "typing")
-    await message.answer(
-        MSG["SCORING_RESULT"].format(
-            task_decomposition_score=scoring["task_decomposition"]["score"],
-            task_decomposition_reasoning=scoring["task_decomposition"]["reasoning"],
-            prompting_tools_score=scoring["prompting_tools"]["score"],
-            prompting_tools_reasoning=scoring["prompting_tools"]["reasoning"],
-            critical_thinking_score=scoring["critical_thinking"]["score"],
-            critical_thinking_reasoning=scoring["critical_thinking"]["reasoning"],
-            total=total,
-            summary=scoring.get("summary", ""),
-        )
+async def _show_scoring(
+    message: Message,
+    scoring: dict,
+    avg: float,
+    github_section: str = "",
+) -> None:
+    text = MSG["SCORING_RESULT"].format(
+        task_decomposition_score=scoring["task_decomposition"]["score"],
+        task_decomposition_reasoning=scoring["task_decomposition"]["reasoning"],
+        prompting_tools_score=scoring["prompting_tools"]["score"],
+        prompting_tools_reasoning=scoring["prompting_tools"]["reasoning"],
+        critical_thinking_score=scoring["critical_thinking"]["score"],
+        critical_thinking_reasoning=scoring["critical_thinking"]["reasoning"],
+        avg=avg,
+        summary=scoring.get("summary", ""),
     )
+    if github_section:
+        text += f"\n\n{github_section}"
+    await message.answer(text)

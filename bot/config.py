@@ -25,9 +25,7 @@ class Settings:
     GITHUB_TOKEN: str = field(default_factory=lambda: getenv("GITHUB_TOKEN", ""))
 
     # Google Sheets
-    GOOGLE_SHEETS_CREDENTIALS: str = field(
-        default_factory=lambda: getenv("GOOGLE_SHEETS_CREDENTIALS", "credentials.json")
-    )
+    GOOGLE_CREDENTIALS_JSON: str = field(default_factory=lambda: getenv("GOOGLE_CREDENTIALS_JSON", ""))
     GOOGLE_SHEET_ID: str = field(default_factory=lambda: getenv("GOOGLE_SHEET_ID", ""))
 
     # Admin
